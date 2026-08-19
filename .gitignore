@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Environments
+.venv/
+.env
+
+# Datasets
+datasets/
+*.zip
+*.tar
+*.tar.gz
+
+# Model checkpoints
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.onnx
+
+# Training outputs
+outputs/
+runs/
+logs/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+
