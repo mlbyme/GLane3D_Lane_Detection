@@ -8,10 +8,7 @@ from datasets.openlane import OpenLaneDataset
 DATA_ROOT = "/home/hp/datasets/openlane/openlane_v1_300"
 
 
-image_transform = transforms.Compose([
-    transforms.Resize((360, 640)),
-    transforms.ToTensor(),
-])
+image_transform = transforms.ToTensor()
 
 
 def collate_fn(batch):
@@ -34,7 +31,7 @@ dataset = OpenLaneDataset(DATA_ROOT, split="training")
 
 loader = DataLoader(
     dataset,
-    batch_size=4,
+    batch_size=1,
     shuffle=True,
     num_workers=0,
     collate_fn=collate_fn,
@@ -49,8 +46,12 @@ print("Image tensor range:")
 print("  min:", batch["images"].min().item())
 print("  max:", batch["images"].max().item())
 
-for i, lanes in enumerate(batch["lane_lines"]):
-    print(f"Sample {i}: lanes={len(lanes)}")
+print("Lanes:", len(batch["lane_lines"][0]))
+print("Intrinsic:")
+print(torch.tensor(batch["intrinsics"][0]))
+
+print("\nImage path:")
+print(batch["image_paths"][0])
 
 print("\nPyTorch version:", torch.__version__)
 print("CUDA available:", torch.cuda.is_available())

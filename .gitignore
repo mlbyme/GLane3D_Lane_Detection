@@ -7,11 +7,9 @@ __pycache__/
 .venv/
 .env
 
-# Datasets
-datasets/
-*.zip
-*.tar
-*.tar.gz
+# Dataset files
+/data/
+/openlane_v1_300/
 
 # Model checkpoints
 checkpoints/
@@ -22,8 +20,6 @@ checkpoints/
 
 # Training outputs
 outputs/
-runs/
-logs/
 
 # Jupyter
 .ipynb_checkpoints/

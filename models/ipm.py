@@ -113,3 +113,22 @@ def make_bev_grid(
         [xx, yy, zz],
         dim=-1,
     ).reshape(-1, 3)
+
+def vehicle_to_camera(xyz, extrinsic):
+    vehicle_to_camera_matrix = torch.linalg.inv(extrinsic)
+
+    ones = torch.ones(
+        *xyz.shape[:-1],
+        1,
+        dtype=xyz.dtype,
+        device=xyz.device,
+    )
+
+    xyz_h = torch.cat(
+        [xyz, ones],
+        dim=-1,
+    )
+
+    camera_h = xyz_h @ vehicle_to_camera_matrix.T
+
+    return camera_h[..., :3]
