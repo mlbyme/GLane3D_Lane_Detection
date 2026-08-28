@@ -42,6 +42,9 @@ LOG_INTERVAL = 10
 LEARNING_RATE = 3e-4
 ACCUMULATION_STEPS = 8
 
+USE_AMP = True
+AMP_DTYPE = torch.bfloat16
+
 
 transform = Compose([
     ToTensor(),
@@ -216,6 +219,15 @@ def optimizer_step(
     scaler.step(optimizer)
     scaler.update()
 
+    #TEMP
+
+    for name, parameter in model.named_parameters():
+        if not torch.isfinite(parameter).all():
+            raise RuntimeError(
+            f"Non-finite parameter after optimizer step: {name}"
+        )
+
+
     optimizer.zero_grad(
         set_to_none=True
     )
@@ -247,7 +259,7 @@ def main():
 
     scaler = torch.amp.GradScaler(
         "cuda",
-        enabled=DEVICE.type == "cuda",
+        enabled=False,
     )
 
     print("Device:", DEVICE)
@@ -281,9 +293,9 @@ def main():
             )
 
             with torch.autocast(
-                device_type=DEVICE.type,
-                dtype=torch.float16,
-                enabled=DEVICE.type == "cuda",
+                device_type="cuda",
+                dtype=AMP_DTYPE,
+                enabled=USE_AMP,
             ):
                 losses = compute_losses(
                     model,
@@ -296,6 +308,26 @@ def main():
 
                 if losses is None:
                     continue
+
+                if not torch.isfinite(losses["total"]):
+                     print("\nNon-finite loss detected")
+
+                     for name in [
+                         "total",
+                         "keypoint",
+                         "regression",
+                         "connection",
+                         "classification",
+                     ]:
+                         value = losses[name]
+                         print(
+                             name,
+                             value.detach().float().item(),
+                         )
+                 
+                     raise RuntimeError(
+                         "Training stopped because loss became non-finite"
+                     )
 
                 loss = (
                     losses["total"]
