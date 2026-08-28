@@ -31,7 +31,7 @@ bev = make_bev_anchor_grid(
     height=56,
     width=32,
     forward_range=100.0,
-    bev_width=20.0,
+    bev_width=34.0,
 )
 
 vehicle_xyz = bev.reshape(-1, 3)
@@ -104,7 +104,7 @@ ax.set_ylabel("v")
 
 output_path = (
     OUTPUT_DIR
-    / "04_vehicle_ground_projection_100m_20mwidth.png"
+    / "05_vehicle_ground_projection_100m_34mwidth.png"
 )
 
 plt.savefig(

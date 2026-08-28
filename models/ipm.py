@@ -1,5 +1,5 @@
 import torch
-
+import torch.nn.functional as F
 
 def openlane_to_camera(xyz):
     """
@@ -132,3 +132,78 @@ def vehicle_to_camera(xyz, extrinsic):
     camera_h = xyz_h @ vehicle_to_camera_matrix.T
 
     return camera_h[..., :3]
+
+
+def sample_bev_features(
+    features,
+    bev,
+    intrinsic,
+    extrinsic,
+    image_size,
+):
+    height, width = image_size
+
+    camera_xyz = vehicle_to_camera(
+        bev.reshape(-1, 3),
+        extrinsic,
+    )
+
+    uv, depth = project_openlane_to_image(
+        camera_xyz,
+        intrinsic,
+    )
+
+    valid = (
+        (depth > 0)
+        & (uv[:, 0] >= 0)
+        & (uv[:, 0] < width)
+        & (uv[:, 1] >= 0)
+        & (uv[:, 1] < height)
+    )
+
+    x = 2.0 * uv[:, 0] / (width - 1) - 1.0
+    y = 2.0 * uv[:, 1] / (height - 1) - 1.0
+
+    grid = torch.stack(
+        [x, y],
+        dim=-1,
+    )
+
+    grid = grid.reshape(
+        1,
+        bev.shape[0],
+        bev.shape[1],
+        2,
+    )
+
+    bev_features = F.grid_sample(
+        features,
+        grid,
+        mode="bilinear",
+        padding_mode="zeros",
+        align_corners=True,
+    )
+
+    valid = valid.reshape(
+        bev.shape[0],
+        bev.shape[1],
+    )
+
+    return bev_features, valid
+
+def camera_to_vehicle(xyz, extrinsic):
+    ones = torch.ones(
+        *xyz.shape[:-1],
+        1,
+        dtype=xyz.dtype,
+        device=xyz.device,
+    )
+
+    xyz_h = torch.cat(
+        [xyz, ones],
+        dim=-1,
+    )
+
+    vehicle_h = xyz_h @ extrinsic.T
+
+    return vehicle_h[..., :3]

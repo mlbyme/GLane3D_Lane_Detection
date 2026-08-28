@@ -1,7 +1,7 @@
 import torch
 
 
-def make_custom_bev_grid(height=56, width=32, bev_width=20.0):
+def make_custom_bev_grid(height=56, width=32, bev_width=34.0):
     spacing = torch.linspace(
         0.5,
         1.5,

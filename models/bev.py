@@ -5,7 +5,7 @@ def make_bev_anchor_grid(
     height=56,
     width=32,
     forward_range=100.0,
-    bev_width=20.0,
+    bev_width=34.0,
 ):
     spacing = torch.linspace(
         0.5,
