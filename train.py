@@ -36,11 +36,11 @@ DEVICE = torch.device(
 
 # Smoke-test settings.
 EPOCHS = 1
-MAX_SAMPLES = 500
-LOG_INTERVAL = 50
+MAX_SAMPLES = 100
+LOG_INTERVAL = 20
 
 LEARNING_RATE = 3e-4
-ACCUMULATION_STEPS = 8
+ACCUMULATION_STEPS = 2
 
 USE_AMP = True
 AMP_DTYPE = torch.bfloat16
@@ -54,9 +54,6 @@ transform = Compose([
     ),
 ])
 
-
-def collate_one(batch):
-    return batch[0]
 
 def collate_batch(batch):
     images = torch.stack([
@@ -88,133 +85,193 @@ def collate_batch(batch):
         ],
     }
 
-def prepare_sample(sample):
-    image = transform(
-        sample["image"]
-    ).unsqueeze(0)
-
-    image = image.to(
+def prepare_batch(batch):
+    image = batch["image"].to(
         DEVICE,
         non_blocking=True,
     )
 
-    intrinsic = torch.tensor(
-        sample["intrinsic"],
-        dtype=torch.float32,
-        device=DEVICE,
+    intrinsic = batch["intrinsic"].to(
+        DEVICE,
+        non_blocking=True,
     )
 
-    extrinsic = torch.tensor(
-        sample["extrinsic"],
-        dtype=torch.float32,
-        device=DEVICE,
+    extrinsic = batch["extrinsic"].to(
+        DEVICE,
+        non_blocking=True,
     )
 
     return image, intrinsic, extrinsic
 
-
 def compute_losses(
     model,
     criterion,
-    sample,
+    batch,
     image,
     intrinsic,
     extrinsic,
 ):
-    row_forward = model.bev_grid[:, 0, 0]
-
-    gt = build_gt_keypoints(
-        sample["lane_lines"],
-        row_forward,
-        extrinsic,
-    )
-
-    if gt is None:
-        return None
-
-    proposal_target = build_proposal_target(
-        sample["lane_lines"],
-        model.bev_grid,
-        extrinsic,
-        positive_radius=2.0,
-    ).unsqueeze(0)
-
     output = model(
         image,
         intrinsic,
         extrinsic,
     )
 
-    proposal_rows = (
-        output["proposal_indices"][0]
-        // model.bev_grid.shape[1]
+    row_forward = model.bev_grid[:, 0, 0]
+
+    batch_losses = []
+
+    total_gt = 0
+    total_m1 = 0
+    total_m2 = 0
+    total_edges = 0
+
+    for b in range(image.shape[0]):
+        gt = build_gt_keypoints(
+            batch["lane_lines"][b],
+            row_forward,
+            extrinsic[b],
+        )
+
+        if gt is None:
+            continue
+
+        proposal_target = build_proposal_target(
+            batch["lane_lines"][b],
+            model.bev_grid,
+            extrinsic[b],
+            positive_radius=2.0,
+        ).unsqueeze(0)
+
+        proposal_rows = (
+            output["proposal_indices"][b]
+            // model.bev_grid.shape[1]
+        )
+
+        matched_pred_1, matched_gt_1 = (
+            match_keypoints(
+                anchors=output["proposals"][b],
+                refined_points=(
+                    output["refined_points"][b]
+                ),
+                gt=gt,
+                proposal_rows=proposal_rows,
+                class_logits=(
+                    output["class_logits"][b]
+                ),
+                repeat=2,
+            )
+        )
+
+        keep = output["keep_indices"][b]
+
+        matched_pred_2, matched_gt_2 = (
+            match_keypoints(
+                anchors=output["proposals"][
+                    b, keep
+                ],
+                refined_points=(
+                    output["strong_points"][b]
+                ),
+                gt=gt,
+                proposal_rows=proposal_rows[
+                    keep
+                ],
+                class_logits=(
+                    output["class_logits"][
+                        b, keep
+                    ]
+                ),
+                repeat=1,
+            )
+        )
+
+        connection_target = (
+            build_connection_targets(
+                matched_pred_2,
+                matched_gt_2,
+                gt,
+                num_predictions=len(
+                    output["strong_points"][b]
+                ),
+            )
+        )
+
+        losses = criterion(
+            seg_logits=output[
+                "seg_logits"
+            ][b:b + 1],
+
+            seg_target=proposal_target,
+
+            x_offset=output[
+                "x_offset"
+            ][b],
+
+            z=output["z"][b],
+
+            class_logits=output[
+                "class_logits"
+            ][b],
+
+            matched_pred=matched_pred_1,
+            matched_gt=matched_gt_1,
+
+            proposal_anchors=output[
+                "proposals"
+            ][b],
+
+            gt_points=gt["points"],
+            gt_classes=gt["categories"],
+
+            adjacency_logits=output[
+                "adjacency_logits"
+            ][b],
+
+            adjacency_target=(
+                connection_target
+            ),
+        )
+
+        batch_losses.append(losses)
+
+        total_gt += len(gt["points"])
+        total_m1 += len(matched_pred_1)
+        total_m2 += len(matched_pred_2)
+
+        total_edges += int(
+            connection_target.sum().item()
+        )
+
+    if not batch_losses:
+        return None
+
+    result = {}
+
+    for name in [
+        "total",
+        "keypoint",
+        "regression",
+        "connection",
+        "classification",
+    ]:
+        result[name] = torch.stack(
+            [
+                item[name]
+                for item in batch_losses
+            ]
+        ).mean()
+
+    result["gt"] = total_gt
+    result["matches_1"] = total_m1
+    result["matches_2"] = total_m2
+    result["connections"] = total_edges
+
+    result["valid_images"] = len(
+        batch_losses
     )
 
-    # First Hungarian pass:
-    # all 512 proposals, GT repeated twice.
-    matched_pred_1, matched_gt_1 = match_keypoints(
-        anchors=output["proposals"][0],
-        refined_points=output["refined_points"][0],
-        gt=gt,
-        proposal_rows=proposal_rows,
-        class_logits=output["class_logits"][0],
-        repeat=2,
-    )
-
-    keep = output["keep_indices"]
-
-    # Second Hungarian pass:
-    # strongest points after PointNMS, no GT repetition.
-    matched_pred_2, matched_gt_2 = match_keypoints(
-        anchors=output["proposals"][0, keep],
-        refined_points=output["strong_points"][0],
-        gt=gt,
-        proposal_rows=proposal_rows[keep],
-        class_logits=output["class_logits"][0, keep],
-        repeat=1,
-    )
-
-    connection_target = build_connection_targets(
-        matched_pred_2,
-        matched_gt_2,
-        gt,
-        num_predictions=len(
-            output["strong_points"][0]
-        ),
-    )
-
-    losses = criterion(
-        seg_logits=output["seg_logits"],
-        seg_target=proposal_target,
-        x_offset=output["x_offset"][0],
-        z=output["z"][0],
-        class_logits=output["class_logits"][0],
-        matched_pred=matched_pred_1,
-        matched_gt=matched_gt_1,
-        proposal_anchors=output["proposals"][0],
-        gt_points=gt["points"],
-        gt_classes=gt["categories"],
-        adjacency_logits=output["adjacency_logits"][0],
-        adjacency_target=connection_target,
-    )
-
-    losses["matches_1"] = len(
-        matched_pred_1
-    )
-
-    losses["matches_2"] = len(
-        matched_pred_2
-    )
-
-    losses["connections"] = int(
-        connection_target.sum().item()
-    )
-
-    losses["gt_keypoints"] = len(
-        gt["points"]
-    )
-
-    return losses
+    return result
 
 
 def optimizer_step(
@@ -270,11 +327,11 @@ def main():
 
     loader = DataLoader(
         dataset,
-        batch_size=1,
+        batch_size=4,
         shuffle=True,
         num_workers=4,
         pin_memory=DEVICE.type == "cuda",
-        collate_fn=collate_one,
+        collate_fn=collate_batch,
     )
 
     model = GLane3D().to(DEVICE)
@@ -294,6 +351,12 @@ def main():
     print("Device:", DEVICE)
     print("Training samples:", len(dataset))
     print("Smoke-test samples:", MAX_SAMPLES)
+    print("Physical batch size:", loader.batch_size)
+    print(
+        "Effective batch size:",
+        loader.batch_size
+        * ACCUMULATION_STEPS,
+    )
     print(
         "Gradient accumulation:",
         ACCUMULATION_STEPS,
@@ -305,130 +368,145 @@ def main():
 
     start_time = time.time()
 
-    for epoch in range(EPOCHS):
+    for epoch in range(EPOCHS): 
         model.train()
 
-        optimizer.zero_grad(
-            set_to_none=True
+    optimizer.zero_grad(
+        set_to_none=True
+    )
+
+    running_loss = 0.0
+    trained_samples = 0
+    batch_step = 0
+    batches_since_step = 0
+
+    for batch in loader:
+        image, intrinsic, extrinsic = (
+            prepare_batch(batch)
         )
 
-        running_loss = 0.0
-        trained_samples = 0
-        samples_since_step = 0
-
-        for sample in loader:
-            image, intrinsic, extrinsic = (
-                prepare_sample(sample)
+        with torch.autocast(
+            device_type=DEVICE.type,
+            dtype=AMP_DTYPE,
+            enabled=USE_AMP,
+        ):
+            losses = compute_losses(
+                model,
+                criterion,
+                batch,
+                image,
+                intrinsic,
+                extrinsic,
             )
 
-            with torch.autocast(
-                device_type="cuda",
-                dtype=AMP_DTYPE,
-                enabled=USE_AMP,
+            if losses is None:
+                continue
+
+            if not torch.isfinite(
+                losses["total"]
             ):
-                losses = compute_losses(
-                    model,
-                    criterion,
-                    sample,
-                    image,
-                    intrinsic,
-                    extrinsic,
-                )
-
-                if losses is None:
-                    continue
-
-                if not torch.isfinite(losses["total"]):
-                     print("\nNon-finite loss detected")
-
-                     for name in [
-                         "total",
-                         "keypoint",
-                         "regression",
-                         "connection",
-                         "classification",
-                     ]:
-                         value = losses[name]
-                         print(
-                             name,
-                             value.detach().float().item(),
-                         )
-                 
-                     raise RuntimeError(
-                         "Training stopped because loss became non-finite"
-                     )
-
-                loss = (
-                    losses["total"]
-                    / ACCUMULATION_STEPS
-                )
-
-            scaler.scale(
-                loss
-            ).backward()
-
-            trained_samples += 1
-            samples_since_step += 1
-
-            running_loss += (
-                losses["total"].item()
-            )
-
-            if (
-                samples_since_step
-                == ACCUMULATION_STEPS
-            ):
-                optimizer_step(
-                    model,
-                    criterion,
-                    optimizer,
-                    scaler,
-                )
-
-                samples_since_step = 0
-
-            if (
-                trained_samples
-                % LOG_INTERVAL
-                == 0
-            ):
-                average_loss = (
-                    running_loss
-                    / trained_samples
-                )
-
                 print(
-                    f"epoch {epoch + 1:02d} "
-                    f"sample {trained_samples:04d} "
-                    f"loss {average_loss:.4f} "
-                    f"kp {losses['keypoint'].item():.3f} "
-                    f"reg {losses['regression'].item():.3f} "
-                    f"conn {losses['connection'].item():.3f} "
-                    f"cls {losses['classification'].item():.3f} "
-                    f"gt {losses['gt_keypoints']} "
-                    f"m1 {losses['matches_1']} "
-                    f"m2 {losses['matches_2']} "
-                    f"edges {losses['connections']}"
+                    "\nNon-finite loss detected"
                 )
 
-            if trained_samples >= MAX_SAMPLES:
-                break
+                for name in [
+                    "total",
+                    "keypoint",
+                    "regression",
+                    "connection",
+                    "classification",
+                ]:
+                    print(
+                        name,
+                        losses[name]
+                        .detach()
+                        .float()
+                        .item(),
+                    )
 
-        # Apply gradients from the final partial
-        # accumulation group.
-        if samples_since_step > 0:
-            gradient_scale = (
-                ACCUMULATION_STEPS
-                / samples_since_step
+                raise RuntimeError(
+                    "Training stopped because "
+                    "loss became non-finite"
+                )
+
+            loss = (
+                losses["total"]
+                / ACCUMULATION_STEPS
             )
 
+        scaler.scale(loss).backward()
+
+        actual_batch_size = (
+            image.shape[0]
+        )
+
+        trained_samples += (
+            actual_batch_size
+        )
+
+        batch_step += 1
+        batches_since_step += 1
+
+        running_loss += (
+            losses["total"].item()
+        )
+
+        if (
+            batches_since_step
+            == ACCUMULATION_STEPS
+        ):
             optimizer_step(
                 model,
                 criterion,
                 optimizer,
                 scaler,
-                gradient_scale=gradient_scale,
             )
+
+            batches_since_step = 0
+
+        if (
+            trained_samples
+            % LOG_INTERVAL
+            == 0
+        ):
+            average_loss = (
+                running_loss
+                / batch_step
+            )
+
+            print(
+                f"epoch {epoch + 1:02d} "
+                f"sample {trained_samples:04d} "
+                f"loss {average_loss:.4f} "
+                f"kp {losses['keypoint'].item():.3f} "
+                f"reg {losses['regression'].item():.3f} "
+                f"conn {losses['connection'].item():.3f} "
+                f"cls {losses['classification'].item():.3f} "
+                f"gt {losses['gt']} "
+                f"m1 {losses['matches_1']} "
+                f"m2 {losses['matches_2']} "
+                f"edges {losses['connections']}"
+            )
+
+        if (
+            trained_samples
+            >= MAX_SAMPLES
+        ):
+            break
+
+    if batches_since_step > 0:
+        gradient_scale = (
+            ACCUMULATION_STEPS
+            / batches_since_step
+        )
+
+        optimizer_step(
+            model,
+            criterion,
+            optimizer,
+            scaler,
+            gradient_scale=gradient_scale,
+        )
 
         checkpoint = {
             "epoch": epoch + 1,

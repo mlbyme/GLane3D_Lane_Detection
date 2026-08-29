@@ -61,16 +61,6 @@ class GLane3D(nn.Module):
         intrinsic,
         extrinsic,
     ):
-        if image.shape[0] != 1:
-            raise ValueError(
-                "Current implementation supports batch size 1"
-            )
-
-        if intrinsic.ndim == 3:
-            intrinsic = intrinsic[0]
-
-        if extrinsic.ndim == 3:
-            extrinsic = extrinsic[0]
 
         front_features = self.backbone(
             image
@@ -133,40 +123,57 @@ class GLane3D(nn.Module):
             dim=-1,
         ).values
 
-        keep = point_nms(
-            refined[0].detach(),
-            confidence[0].detach(),
-            max_points=self.max_keypoints,
-        )
-
-        strong_points = refined[:, keep]
-
-        strong_connection = (
-            output["connection"][:, keep]
-        )
-
-        adjacency_logits = (
-            self.connection_head(
-                strong_points,
-                strong_connection,
+        keep_indices = []
+        strong_points = []
+        strong_connection_features = []
+        adjacency_logits = []
+    
+        for b in range(image.shape[0]):
+            keep = point_nms(
+                refined[b].detach(),
+                confidence[b].detach(),
+                max_points=self.max_keypoints,
             )
-        )
+    
+            points = refined[b, keep]
+    
+            connection_features = (
+                output["connection"][b, keep]
+            )
+    
+            adjacency = self.connection_head(
+                points.unsqueeze(0),
+                connection_features.unsqueeze(0),
+            )[0]
+    
+            keep_indices.append(keep)
+            strong_points.append(points)
+            strong_connection_features.append(
+                connection_features
+            )
+            adjacency_logits.append(adjacency)
 
         return {
             "bev_features": bev_features,
             "valid_bev": valid_bev,
             "seg_logits": seg_logits,
+
             "proposals": proposals,
             "proposal_scores": proposal_scores,
             "proposal_indices": indices,
+
             "x_offset": output["x_offset"],
             "z": output["z"],
             "class_logits": output["class_logits"],
             "connection_features": output["connection"],
+
             "refined_points": refined,
             "confidence": confidence,
-            "keep_indices": keep,
+
+            "keep_indices": keep_indices,
             "strong_points": strong_points,
-            "strong_connection_features": strong_connection,
+            "strong_connection_features":
+                strong_connection_features,
+
             "adjacency_logits": adjacency_logits,
         }

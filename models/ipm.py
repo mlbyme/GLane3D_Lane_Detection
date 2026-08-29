@@ -36,38 +36,24 @@ def openlane_to_camera(xyz):
         dim=-1,
     )
 
-
 def project_openlane_to_image(
     xyz,
     intrinsic,
 ):
-    """
-    Project OpenLane XYZ points into image coordinates.
-
-    Args:
-        xyz:
-            Tensor [N, 3] in OpenLane/Waymo coordinates.
-
-        intrinsic:
-            Tensor [3, 3].
-
-    Returns:
-        uv:
-            Tensor [N, 2].
-
-        depth:
-            Tensor [N].
-    """
-
     camera_xyz = openlane_to_camera(xyz)
 
     depth = camera_xyz[..., 2]
-
     safe_depth = depth.clamp(min=1e-6)
 
-    uvw = camera_xyz @ intrinsic.T
+    uvw = torch.matmul(
+        camera_xyz,
+        intrinsic.transpose(-1, -2),
+    )
 
-    uv = uvw[..., :2] / safe_depth.unsqueeze(-1)
+    uv = (
+        uvw[..., :2]
+        / safe_depth.unsqueeze(-1)
+    )
 
     return uv, depth
 
@@ -114,8 +100,13 @@ def make_bev_grid(
         dim=-1,
     ).reshape(-1, 3)
 
-def vehicle_to_camera(xyz, extrinsic):
-    vehicle_to_camera_matrix = torch.linalg.inv(extrinsic)
+def vehicle_to_camera(
+    xyz,
+    extrinsic,
+):
+    vehicle_to_camera_matrix = (
+        torch.linalg.inv(extrinsic)
+    )
 
     ones = torch.ones(
         *xyz.shape[:-1],
@@ -129,7 +120,13 @@ def vehicle_to_camera(xyz, extrinsic):
         dim=-1,
     )
 
-    camera_h = xyz_h @ vehicle_to_camera_matrix.T
+    camera_h = torch.matmul(
+        xyz_h,
+        vehicle_to_camera_matrix.transpose(
+            -1,
+            -2,
+        ),
+    )
 
     return camera_h[..., :3]
 
@@ -142,9 +139,46 @@ def sample_bev_features(
     image_size,
 ):
     height, width = image_size
+    batch_size = features.shape[0]
+
+    if intrinsic.ndim == 2:
+        intrinsic = intrinsic.unsqueeze(0).expand(
+            batch_size,
+            -1,
+            -1,
+        )
+
+    if extrinsic.ndim == 2:
+        extrinsic = extrinsic.unsqueeze(0).expand(
+            batch_size,
+            -1,
+            -1,
+        )
+
+    if intrinsic.shape[0] != batch_size:
+        raise ValueError(
+            "Intrinsic batch size does not match "
+            "feature batch size"
+        )
+
+    if extrinsic.shape[0] != batch_size:
+        raise ValueError(
+            "Extrinsic batch size does not match "
+            "feature batch size"
+        )
+
+    anchors = bev.reshape(
+        1,
+        -1,
+        3,
+    ).expand(
+        batch_size,
+        -1,
+        -1,
+    )
 
     camera_xyz = vehicle_to_camera(
-        bev.reshape(-1, 3),
+        anchors,
         extrinsic,
     )
 
@@ -155,14 +189,23 @@ def sample_bev_features(
 
     valid = (
         (depth > 0)
-        & (uv[:, 0] >= 0)
-        & (uv[:, 0] < width)
-        & (uv[:, 1] >= 0)
-        & (uv[:, 1] < height)
+        & (uv[..., 0] >= 0)
+        & (uv[..., 0] < width)
+        & (uv[..., 1] >= 0)
+        & (uv[..., 1] < height)
     )
 
-    x = 2.0 * uv[:, 0] / (width - 1) - 1.0
-    y = 2.0 * uv[:, 1] / (height - 1) - 1.0
+    x = (
+        2.0 * uv[..., 0]
+        / (width - 1)
+        - 1.0
+    )
+
+    y = (
+        2.0 * uv[..., 1]
+        / (height - 1)
+        - 1.0
+    )
 
     grid = torch.stack(
         [x, y],
@@ -170,7 +213,7 @@ def sample_bev_features(
     )
 
     grid = grid.reshape(
-        1,
+        batch_size,
         bev.shape[0],
         bev.shape[1],
         2,
@@ -185,13 +228,17 @@ def sample_bev_features(
     )
 
     valid = valid.reshape(
+        batch_size,
         bev.shape[0],
         bev.shape[1],
     )
 
     return bev_features, valid
 
-def camera_to_vehicle(xyz, extrinsic):
+def camera_to_vehicle(
+    xyz,
+    extrinsic,
+):
     ones = torch.ones(
         *xyz.shape[:-1],
         1,
@@ -204,6 +251,12 @@ def camera_to_vehicle(xyz, extrinsic):
         dim=-1,
     )
 
-    vehicle_h = xyz_h @ extrinsic.T
+    vehicle_h = torch.matmul(
+        xyz_h,
+        extrinsic.transpose(
+            -1,
+            -2,
+        ),
+    )
 
     return vehicle_h[..., :3]
