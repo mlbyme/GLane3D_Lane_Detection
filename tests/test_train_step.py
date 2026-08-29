@@ -149,7 +149,7 @@ matched_pred_1, matched_gt_1 = match_keypoints(
 # Hungarian matching #2:
 # strongest PointNMS keypoints, no GT repetition.
 
-keep = output["keep_indices"]
+keep = output["keep_indices"][0]
 
 strong_anchors = output["proposals"][0, keep]
 

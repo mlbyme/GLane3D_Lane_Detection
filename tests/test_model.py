@@ -89,10 +89,15 @@ print(
 
 print(
     "Strong points:",
-    output["strong_points"].shape,
+    output["strong_points"][0].shape,
 )
 
 print(
     "Adjacency:",
-    output["adjacency_logits"].shape,
+    output["adjacency_logits"][0].shape,
+)
+
+print(
+    "Keep indices:",
+    output["keep_indices"][0].shape,
 )
