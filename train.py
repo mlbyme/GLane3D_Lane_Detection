@@ -36,8 +36,8 @@ DEVICE = torch.device(
 
 # Smoke-test settings.
 EPOCHS = 1
-MAX_SAMPLES = 100
-LOG_INTERVAL = 10
+MAX_SAMPLES = 500
+LOG_INTERVAL = 50
 
 LEARNING_RATE = 3e-4
 ACCUMULATION_STEPS = 8
@@ -58,6 +58,35 @@ transform = Compose([
 def collate_one(batch):
     return batch[0]
 
+def collate_batch(batch):
+    images = torch.stack([
+        transform(sample["image"])
+        for sample in batch
+    ])
+
+    intrinsics = torch.tensor(
+        [sample["intrinsic"] for sample in batch],
+        dtype=torch.float32,
+    )
+
+    extrinsics = torch.tensor(
+        [sample["extrinsic"] for sample in batch],
+        dtype=torch.float32,
+    )
+
+    return {
+        "image": images,
+        "intrinsic": intrinsics,
+        "extrinsic": extrinsics,
+        "lane_lines": [
+            sample["lane_lines"]
+            for sample in batch
+        ],
+        "image_path": [
+            sample["image_path"]
+            for sample in batch
+        ],
+    }
 
 def prepare_sample(sample):
     image = transform(
@@ -241,7 +270,7 @@ def main():
 
     loader = DataLoader(
         dataset,
-        batch_size=4,
+        batch_size=1,
         shuffle=True,
         num_workers=4,
         pin_memory=DEVICE.type == "cuda",

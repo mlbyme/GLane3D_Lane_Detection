@@ -48,6 +48,20 @@ def match_keypoints(
             dim=0,
         )
 
+        if not (
+        len(gt_points)
+        == len(gt_rows)
+        == len(gt_classes)
+        == len(original_indices)
+        ):
+            raise RuntimeError(
+            "GT fields have inconsistent lengths after repetition: "
+            f"points={len(gt_points)}, "
+            f"rows={len(gt_rows)}, "
+            f"classes={len(gt_classes)}, "
+            f"indices={len(original_indices)}"
+        )
+
     pred_lateral = refined_points[:, 1]
     pred_z = refined_points[:, 2]
 
@@ -74,21 +88,27 @@ def match_keypoints(
             dim=-1,
         )
 
-    if gt_classes.min() < 0:
-        raise ValueError(
-        "GT class index is negative"
-    )
+        if gt_classes.min() < 0:
+            raise ValueError(
+                "GT class index is negative"
+            )
 
-    if gt_classes.max() >= class_probs.shape[-1]:
-        raise ValueError(
-            "GT class index exceeds classifier size: "
-            f"max={gt_classes.max().item()}, "
-            f"num_classes={class_probs.shape[-1]}"
+        if gt_classes.max() >= class_probs.shape[-1]:
+            raise ValueError(
+                "GT class index exceeds classifier size: "
+                f"max={gt_classes.max().item()}, "
+                f"num_classes={class_probs.shape[-1]}"
+            )
+
+        class_cost = -class_probs[
+            :,
+            gt_classes,
+        ]
+
+        cost = (
+            cost
+            + class_weight * class_cost
         )
-    
-    class_cost = -class_probs[:, gt_classes]
-
-    cost = cost + class_weight * class_cost
 
     same_row = (
         proposal_rows[:, None]

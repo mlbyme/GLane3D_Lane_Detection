@@ -188,6 +188,21 @@ def build_gt_keypoints(
     categories = []
 
     for lane_id, lane in enumerate(lane_lines):
+
+        raw_category = int(lane["category"])
+
+        if raw_category == 0:
+            continue
+        
+        if raw_category not in CATEGORY_TO_INDEX:
+            raise ValueError(
+                f"Unknown OpenLane category: {raw_category}"
+            )
+
+        category = CATEGORY_TO_INDEX[
+            raw_category
+        ]
+
         xyz = torch.tensor(
             lane["xyz"],
             dtype=torch.float32,
@@ -236,7 +251,7 @@ def build_gt_keypoints(
         )
 
         raw_category = int(lane["category"])
-        
+
         if raw_category == 0:
             continue
         
@@ -258,15 +273,37 @@ def build_gt_keypoints(
             )
         )
 
+    # No usable GT keypoints for this sample.
     if not points:
         return None
+        
+    points = torch.cat(points)
+    rows = torch.cat(rows)
+    lane_ids = torch.cat(lane_ids)
+    categories = torch.cat(categories)
+
+    num_points = len(points)
+
+    if not (
+        len(rows)
+        == num_points
+        == len(lane_ids)
+        == len(categories)
+    ):
+        raise RuntimeError(
+            "GT keypoint fields have inconsistent lengths: "
+            f"points={len(points)}, "
+            f"rows={len(rows)}, "
+            f"lane_ids={len(lane_ids)}, "
+            f"categories={len(categories)}"
+        )
 
     return {
-        "points": torch.cat(points),
-        "rows": torch.cat(rows),
-        "lane_ids": torch.cat(lane_ids),
-        "categories": torch.cat(categories),
-}
+        "points": points,
+        "rows": rows,
+        "lane_ids": lane_ids,
+        "categories": categories,
+    }
 
 def build_connection_targets(
     matched_pred,

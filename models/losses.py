@@ -61,8 +61,12 @@ class GLane3DLoss(nn.Module):
             seg_logits.squeeze(1),
             seg_target,
         )
+        
+        has_matches = (
+            len(matched_pred) > 0
+        )
 
-        if len(matched_pred) > 0:
+        if has_matches:
             pred_x = x_offset[matched_pred]
             pred_z = z[matched_pred]
 
@@ -127,13 +131,28 @@ class GLane3DLoss(nn.Module):
             loss_cls,
         ])
 
+        active = torch.tensor(
+            [
+                1.0,
+                float(has_matches),
+                1.0,
+                float(has_matches),
+            ],
+            dtype=losses.dtype,
+            device=losses.device,
+        )
+
         weights = torch.exp(
             -self.log_vars
         )
 
-        total = (
+        weighted = (
             weights * losses
             + self.log_vars
+        )
+
+        total = (
+            weighted * active
         ).sum()
 
         return {
