@@ -1,13 +1,10 @@
 from pathlib import Path
+import math
 import time
 
 import torch
 from torch.utils.data import DataLoader
-from torchvision.transforms import (
-    Compose,
-    Normalize,
-    ToTensor,
-)
+from torchvision.transforms import Compose, Normalize, ToTensor
 
 from datasets.openlane import OpenLaneDataset
 from datasets.targets import (
@@ -29,21 +26,29 @@ CHECKPOINT_DIR = Path("checkpoints")
 CHECKPOINT_DIR.mkdir(exist_ok=True)
 
 DEVICE = torch.device(
-    "cuda"
-    if torch.cuda.is_available()
-    else "cpu"
+    "cuda" if torch.cuda.is_available() else "cpu"
 )
 
-# Smoke-test settings.
-EPOCHS = 1
-MAX_SAMPLES = 100
-LOG_INTERVAL = 20
+# Full Lane300 training settings.
+EPOCHS = 24
+MAX_SAMPLES = None
+LOG_INTERVAL = 200
 
 LEARNING_RATE = 3e-4
-ACCUMULATION_STEPS = 2
+
+BATCH_SIZE = 4
+ACCUMULATION_STEPS = 4
 
 USE_AMP = True
 AMP_DTYPE = torch.bfloat16
+
+# Paper specifies warm-up + cosine annealing,
+# but does not specify the exact warm-up duration.
+WARMUP_EPOCHS = 1
+WARMUP_START_FACTOR = 0.1
+
+RUN_NAME = "glane3d_lane300_full24"
+NUM_WORKERS = 4
 
 
 transform = Compose([
@@ -85,6 +90,7 @@ def collate_batch(batch):
         ],
     }
 
+
 def prepare_batch(batch):
     image = batch["image"].to(
         DEVICE,
@@ -102,6 +108,7 @@ def prepare_batch(batch):
     )
 
     return image, intrinsic, extrinsic
+
 
 def compute_losses(
     model,
@@ -148,89 +155,48 @@ def compute_losses(
             // model.bev_grid.shape[1]
         )
 
-        matched_pred_1, matched_gt_1 = (
-            match_keypoints(
-                anchors=output["proposals"][b],
-                refined_points=(
-                    output["refined_points"][b]
-                ),
-                gt=gt,
-                proposal_rows=proposal_rows,
-                class_logits=(
-                    output["class_logits"][b]
-                ),
-                repeat=2,
-            )
+        matched_pred_1, matched_gt_1 = match_keypoints(
+            anchors=output["proposals"][b],
+            refined_points=output["refined_points"][b],
+            gt=gt,
+            proposal_rows=proposal_rows,
+            class_logits=output["class_logits"][b],
+            repeat=2,
         )
 
         keep = output["keep_indices"][b]
 
-        matched_pred_2, matched_gt_2 = (
-            match_keypoints(
-                anchors=output["proposals"][
-                    b, keep
-                ],
-                refined_points=(
-                    output["strong_points"][b]
-                ),
-                gt=gt,
-                proposal_rows=proposal_rows[
-                    keep
-                ],
-                class_logits=(
-                    output["class_logits"][
-                        b, keep
-                    ]
-                ),
-                repeat=1,
-            )
+        matched_pred_2, matched_gt_2 = match_keypoints(
+            anchors=output["proposals"][b, keep],
+            refined_points=output["strong_points"][b],
+            gt=gt,
+            proposal_rows=proposal_rows[keep],
+            class_logits=output["class_logits"][b, keep],
+            repeat=1,
         )
 
-        connection_target = (
-            build_connection_targets(
-                matched_pred_2,
-                matched_gt_2,
-                gt,
-                num_predictions=len(
-                    output["strong_points"][b]
-                ),
-            )
+        connection_target = build_connection_targets(
+            matched_pred_2,
+            matched_gt_2,
+            gt,
+            num_predictions=len(
+                output["strong_points"][b]
+            ),
         )
 
         losses = criterion(
-            seg_logits=output[
-                "seg_logits"
-            ][b:b + 1],
-
+            seg_logits=output["seg_logits"][b:b + 1],
             seg_target=proposal_target,
-
-            x_offset=output[
-                "x_offset"
-            ][b],
-
+            x_offset=output["x_offset"][b],
             z=output["z"][b],
-
-            class_logits=output[
-                "class_logits"
-            ][b],
-
+            class_logits=output["class_logits"][b],
             matched_pred=matched_pred_1,
             matched_gt=matched_gt_1,
-
-            proposal_anchors=output[
-                "proposals"
-            ][b],
-
+            proposal_anchors=output["proposals"][b],
             gt_points=gt["points"],
             gt_classes=gt["categories"],
-
-            adjacency_logits=output[
-                "adjacency_logits"
-            ][b],
-
-            adjacency_target=(
-                connection_target
-            ),
+            adjacency_logits=output["adjacency_logits"][b],
+            adjacency_target=connection_target,
         )
 
         batch_losses.append(losses)
@@ -238,7 +204,6 @@ def compute_losses(
         total_gt += len(gt["points"])
         total_m1 += len(matched_pred_1)
         total_m2 += len(matched_pred_2)
-
         total_edges += int(
             connection_target.sum().item()
         )
@@ -255,21 +220,16 @@ def compute_losses(
         "connection",
         "classification",
     ]:
-        result[name] = torch.stack(
-            [
-                item[name]
-                for item in batch_losses
-            ]
-        ).mean()
+        result[name] = torch.stack([
+            item[name]
+            for item in batch_losses
+        ]).mean()
 
     result["gt"] = total_gt
     result["matches_1"] = total_m1
     result["matches_2"] = total_m2
     result["connections"] = total_edges
-
-    result["valid_images"] = len(
-        batch_losses
-    )
+    result["valid_images"] = len(batch_losses)
 
     return result
 
@@ -279,22 +239,20 @@ def optimizer_step(
     criterion,
     optimizer,
     scaler,
+    scheduler,
     gradient_scale=1.0,
 ):
     scaler.unscale_(optimizer)
 
-    # Needed only when the final accumulation group
-    # contains fewer than ACCUMULATION_STEPS samples.
     if gradient_scale != 1.0:
-        for parameter in list(
-            model.parameters()
-        ) + list(
-            criterion.parameters()
-        ):
+        parameters = (
+            list(model.parameters())
+            + list(criterion.parameters())
+        )
+
+        for parameter in parameters:
             if parameter.grad is not None:
-                parameter.grad.mul_(
-                    gradient_scale
-                )
+                parameter.grad.mul_(gradient_scale)
 
     torch.nn.utils.clip_grad_norm_(
         list(model.parameters())
@@ -304,18 +262,132 @@ def optimizer_step(
 
     scaler.step(optimizer)
     scaler.update()
-
-    #TEMP
+    scheduler.step()
 
     for name, parameter in model.named_parameters():
         if not torch.isfinite(parameter).all():
             raise RuntimeError(
-            f"Non-finite parameter after optimizer step: {name}"
+                "Non-finite parameter after "
+                f"optimizer step: {name}"
+            )
+
+    optimizer.zero_grad(set_to_none=True)
+
+
+def save_checkpoint(
+    model,
+    criterion,
+    optimizer,
+    scheduler,
+    epoch,
+    epoch_samples,
+    total_samples_seen,
+    optimizer_steps,
+):
+    checkpoint = {
+        "epoch": epoch,
+        "model": model.state_dict(),
+        "criterion": criterion.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "epoch_samples": epoch_samples,
+        "total_samples_seen": total_samples_seen,
+        "optimizer_steps": optimizer_steps,
+    }
+
+    checkpoint_path = (
+        CHECKPOINT_DIR
+        / f"{RUN_NAME}_epoch_{epoch:02d}.pt"
+    )
+
+    temp_path = (
+        CHECKPOINT_DIR
+        / f"{RUN_NAME}_epoch_{epoch:02d}.tmp"
+    )
+
+    torch.save(checkpoint, temp_path)
+    temp_path.replace(checkpoint_path)
+
+    size_mb = (
+        checkpoint_path.stat().st_size
+        / (1024 ** 2)
+    )
+
+    print(
+        f"Saved checkpoint: {checkpoint_path}"
+    )
+    print(
+        f"Checkpoint size: {size_mb:.2f} MB"
+    )
+
+    if size_mb < 10:
+        raise RuntimeError(
+            "Checkpoint file is unexpectedly small: "
+            f"{size_mb:.2f} MB"
         )
 
 
-    optimizer.zero_grad(
-        set_to_none=True
+def build_scheduler(
+    optimizer,
+    loader,
+):
+    if MAX_SAMPLES is None:
+        batches_per_epoch = len(loader)
+    else:
+        samples_per_epoch = min(
+            MAX_SAMPLES,
+            len(loader.dataset),
+        )
+        batches_per_epoch = math.ceil(
+            samples_per_epoch / BATCH_SIZE
+        )
+
+    optimizer_steps_per_epoch = math.ceil(
+        batches_per_epoch
+        / ACCUMULATION_STEPS
+    )
+
+    warmup_steps = (
+        WARMUP_EPOCHS
+        * optimizer_steps_per_epoch
+    )
+
+    total_steps = (
+        EPOCHS
+        * optimizer_steps_per_epoch
+    )
+
+    cosine_steps = max(
+        1,
+        total_steps - warmup_steps,
+    )
+
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=WARMUP_START_FACTOR,
+        end_factor=1.0,
+        total_iters=max(1, warmup_steps),
+    )
+
+    cosine = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=cosine_steps,
+        )
+    )
+
+    scheduler = (
+        torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup, cosine],
+            milestones=[warmup_steps],
+        )
+    )
+
+    return (
+        scheduler,
+        optimizer_steps_per_epoch,
+        total_steps,
     )
 
 
@@ -327,10 +399,12 @@ def main():
 
     loader = DataLoader(
         dataset,
-        batch_size=4,
+        batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=4,
-        pin_memory=DEVICE.type == "cuda",
+        num_workers=NUM_WORKERS,
+        pin_memory=(
+            DEVICE.type == "cuda"
+        ),
         collate_fn=collate_batch,
     )
 
@@ -343,6 +417,16 @@ def main():
         lr=LEARNING_RATE,
     )
 
+    (
+        scheduler,
+        optimizer_steps_per_epoch,
+        total_optimizer_steps,
+    ) = build_scheduler(
+        optimizer,
+        loader,
+    )
+
+    # BF16 does not require gradient scaling.
     scaler = torch.amp.GradScaler(
         "cuda",
         enabled=False,
@@ -350,16 +434,28 @@ def main():
 
     print("Device:", DEVICE)
     print("Training samples:", len(dataset))
-    print("Smoke-test samples:", MAX_SAMPLES)
-    print("Physical batch size:", loader.batch_size)
-    print(
-        "Effective batch size:",
-        loader.batch_size
-        * ACCUMULATION_STEPS,
-    )
+    print("Epochs:", EPOCHS)
+    print("Physical batch size:", BATCH_SIZE)
     print(
         "Gradient accumulation:",
         ACCUMULATION_STEPS,
+    )
+    print(
+        "Effective batch size:",
+        BATCH_SIZE * ACCUMULATION_STEPS,
+    )
+    print(
+        "Optimizer steps / epoch:",
+        optimizer_steps_per_epoch,
+    )
+    print(
+        "Total optimizer steps:",
+        total_optimizer_steps,
+    )
+    print("Warm-up epochs:", WARMUP_EPOCHS)
+    print(
+        "Initial LR:",
+        optimizer.param_groups[0]["lr"],
     )
     print()
 
@@ -368,183 +464,210 @@ def main():
 
     start_time = time.time()
 
-    for epoch in range(EPOCHS): 
+    total_samples_seen = 0
+    global_optimizer_step = 0
+
+    for epoch in range(EPOCHS):
         model.train()
+        optimizer.zero_grad(set_to_none=True)
 
-    optimizer.zero_grad(
-        set_to_none=True
-    )
+        running_loss = 0.0
+        trained_samples = 0
+        batches_since_step = 0
 
-    running_loss = 0.0
-    trained_samples = 0
-    batch_step = 0
-    batches_since_step = 0
+        epoch_start_time = time.time()
 
-    for batch in loader:
-        image, intrinsic, extrinsic = (
-            prepare_batch(batch)
-        )
-
-        with torch.autocast(
-            device_type=DEVICE.type,
-            dtype=AMP_DTYPE,
-            enabled=USE_AMP,
-        ):
-            losses = compute_losses(
-                model,
-                criterion,
-                batch,
-                image,
-                intrinsic,
-                extrinsic,
+        for batch in loader:
+            image, intrinsic, extrinsic = (
+                prepare_batch(batch)
             )
 
-            if losses is None:
-                continue
-
-            if not torch.isfinite(
-                losses["total"]
+            with torch.autocast(
+                device_type=DEVICE.type,
+                dtype=AMP_DTYPE,
+                enabled=(
+                    USE_AMP
+                    and DEVICE.type == "cuda"
+                ),
             ):
-                print(
-                    "\nNon-finite loss detected"
+                losses = compute_losses(
+                    model,
+                    criterion,
+                    batch,
+                    image,
+                    intrinsic,
+                    extrinsic,
                 )
 
-                for name in [
-                    "total",
-                    "keypoint",
-                    "regression",
-                    "connection",
-                    "classification",
-                ]:
+                if losses is None:
+                    continue
+
+                if not torch.isfinite(
+                    losses["total"]
+                ):
                     print(
-                        name,
-                        losses[name]
-                        .detach()
-                        .float()
-                        .item(),
+                        "\nNon-finite loss detected"
                     )
 
-                raise RuntimeError(
-                    "Training stopped because "
-                    "loss became non-finite"
+                    for name in [
+                        "total",
+                        "keypoint",
+                        "regression",
+                        "connection",
+                        "classification",
+                    ]:
+                        print(
+                            name,
+                            losses[name]
+                            .detach()
+                            .float()
+                            .item(),
+                        )
+
+                    raise RuntimeError(
+                        "Training stopped because "
+                        "loss became non-finite"
+                    )
+
+                loss = (
+                    losses["total"]
+                    / ACCUMULATION_STEPS
                 )
 
-            loss = (
-                losses["total"]
-                / ACCUMULATION_STEPS
+            scaler.scale(loss).backward()
+
+            actual_batch_size = image.shape[0]
+
+            trained_samples += actual_batch_size
+            total_samples_seen += actual_batch_size
+            batches_since_step += 1
+
+            running_loss += (
+                losses["total"].item()
+                * actual_batch_size
             )
 
-        scaler.scale(loss).backward()
+            if (
+                batches_since_step
+                == ACCUMULATION_STEPS
+            ):
+                optimizer_step(
+                    model,
+                    criterion,
+                    optimizer,
+                    scaler,
+                    scheduler,
+                    gradient_scale=1.0,
+                )
 
-        actual_batch_size = (
-            image.shape[0]
-        )
+                global_optimizer_step += 1
+                batches_since_step = 0
 
-        trained_samples += (
-            actual_batch_size
-        )
+            if (
+                trained_samples
+                % LOG_INTERVAL
+                == 0
+            ):
+                average_loss = (
+                    running_loss
+                    / max(trained_samples, 1)
+                )
 
-        batch_step += 1
-        batches_since_step += 1
+                current_lr = (
+                    optimizer.param_groups[0]["lr"]
+                )
 
-        running_loss += (
-            losses["total"].item()
-        )
+                print(
+                    f"epoch {epoch + 1:02d} "
+                    f"sample {trained_samples:05d} "
+                    f"loss {average_loss:.4f} "
+                    f"kp {losses['keypoint'].item():.3f} "
+                    f"reg {losses['regression'].item():.3f} "
+                    f"conn {losses['connection'].item():.3f} "
+                    f"cls {losses['classification'].item():.3f} "
+                    f"lr {current_lr:.2e} "
+                    f"gt {losses['gt']} "
+                    f"m1 {losses['matches_1']} "
+                    f"m2 {losses['matches_2']} "
+                    f"edges {losses['connections']}"
+                )
 
-        if (
-            batches_since_step
-            == ACCUMULATION_STEPS
-        ):
+            if (
+                MAX_SAMPLES is not None
+                and trained_samples
+                >= MAX_SAMPLES
+            ):
+                break
+
+        if batches_since_step > 0:
+            gradient_scale = (
+                ACCUMULATION_STEPS
+                / batches_since_step
+            )
+
             optimizer_step(
                 model,
                 criterion,
                 optimizer,
                 scaler,
+                scheduler,
+                gradient_scale=gradient_scale,
             )
 
-            batches_since_step = 0
+            global_optimizer_step += 1
 
-        if (
-            trained_samples
-            % LOG_INTERVAL
-            == 0
-        ):
-            average_loss = (
-                running_loss
-                / batch_step
-            )
-
-            print(
-                f"epoch {epoch + 1:02d} "
-                f"sample {trained_samples:04d} "
-                f"loss {average_loss:.4f} "
-                f"kp {losses['keypoint'].item():.3f} "
-                f"reg {losses['regression'].item():.3f} "
-                f"conn {losses['connection'].item():.3f} "
-                f"cls {losses['classification'].item():.3f} "
-                f"gt {losses['gt']} "
-                f"m1 {losses['matches_1']} "
-                f"m2 {losses['matches_2']} "
-                f"edges {losses['connections']}"
-            )
-
-        if (
-            trained_samples
-            >= MAX_SAMPLES
-        ):
-            break
-
-    if batches_since_step > 0:
-        gradient_scale = (
-            ACCUMULATION_STEPS
-            / batches_since_step
+        save_checkpoint(
+            model=model,
+            criterion=criterion,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            epoch=epoch + 1,
+            epoch_samples=trained_samples,
+            total_samples_seen=total_samples_seen,
+            optimizer_steps=global_optimizer_step,
         )
 
-        optimizer_step(
-            model,
-            criterion,
-            optimizer,
-            scaler,
-            gradient_scale=gradient_scale,
+        epoch_elapsed = (
+            time.time() - epoch_start_time
         )
 
-        checkpoint = {
-            "epoch": epoch + 1,
-            "model": model.state_dict(),
-            "criterion": criterion.state_dict(),
-            "optimizer": optimizer.state_dict(),
-        }
-
-        checkpoint_path = (
-            CHECKPOINT_DIR
-            / "glane3d_smoke.pt"
+        epoch_average_loss = (
+            running_loss
+            / max(trained_samples, 1)
         )
 
-        torch.save(
-            checkpoint,
-            checkpoint_path,
-        )
-
-        print()
         print(
-            "Saved checkpoint:",
-            checkpoint_path,
+            f"Epoch {epoch + 1:02d} complete"
         )
+        print("Samples:", trained_samples)
+        print(
+            "Average loss:",
+            f"{epoch_average_loss:.4f}",
+        )
+        print(
+            "Epoch time:",
+            f"{epoch_elapsed:.2f} seconds",
+        )
+        print(
+            "Seconds per sample:",
+            f"{epoch_elapsed / max(trained_samples, 1):.3f}",
+        )
+        print()
 
     elapsed = time.time() - start_time
 
-    print()
-    print("Smoke training complete")
-    print("Samples:", trained_samples)
-
+    print("Training complete")
     print(
-        "Elapsed time:",
-        f"{elapsed:.2f} seconds",
+        "Total samples seen:",
+        total_samples_seen,
     )
-
     print(
-        "Seconds per sample:",
-        f"{elapsed / max(trained_samples, 1):.3f}",
+        "Total optimizer steps:",
+        global_optimizer_step,
+    )
+    print(
+        "Total elapsed time:",
+        f"{elapsed:.2f} seconds",
     )
 
     if DEVICE.type == "cuda":

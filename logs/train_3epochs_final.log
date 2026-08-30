@@ -1,0 +1,7 @@
+Device: cuda
+Training samples: 47533
+Smoke-test samples: 47533
+Physical batch size: 8
+Effective batch size: 8
+Gradient accumulation: 1
+
